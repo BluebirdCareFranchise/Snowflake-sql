@@ -1,0 +1,201 @@
+/*----------------------------------------------------------------------------------------
+Module:   CONNECT_3_UpdatesFromOTH
+Purpose:  Get customer status updates from OTH (via Pipe) and send to HubSpot (JSON)
+Depends:  Pipe auto-ingests CSVs from OTH stage
+Schedule: Pipe refresh xx:03, JSON export xx:05, Mon-Fri
+
+Flow:
+  OTH drops CSV → Pipe ingests to STG → Transform & hash-dedupe → Export JSON → HubSpot
+----------------------------------------------------------------------------------------*/
+
+/*----------------------------------------------------------------------------------------
+One-Time Setup: File Format, Tables, Pipe, Stream
+----------------------------------------------------------------------------------------*/
+/*
+CREATE OR REPLACE FILE FORMAT BBC_SOURCE_RAW.HS_STRUTO.PIPE_CSV_SAFE
+    TYPE = CSV
+    FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+    SKIP_HEADER = 1
+    EMPTY_FIELD_AS_NULL = FALSE
+    TRIM_SPACE = FALSE;
+
+CREATE OR REPLACE TABLE BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH_STG (
+    HS_OBJECT_ID VARCHAR, FIRSTNAME VARCHAR, SURNAME VARCHAR, CUSTOMER_STATUS VARCHAR,
+    CUSTOMER_STATUS_2 VARCHAR, CUSTOMER_STATUS_OTHER VARCHAR, ADDRESS VARCHAR, CITY VARCHAR,
+    ZIP VARCHAR, COUNTRY VARCHAR, EMAIL VARCHAR, MOBILEPHONE VARCHAR, PHONE VARCHAR,
+    CONTACT_TYPE VARCHAR
+);
+
+CREATE OR REPLACE TABLE BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH (
+    HS_OBJECT_ID VARCHAR, FIRSTNAME VARCHAR, SURNAME VARCHAR, CUSTOMER_STATUS VARCHAR,
+    CUSTOMER_STATUS_2 VARCHAR, CUSTOMER_STATUS_OTHER VARCHAR, ADDRESS VARCHAR, CITY VARCHAR,
+    ZIP VARCHAR, COUNTRY VARCHAR, EMAIL VARCHAR, MOBILEPHONE VARCHAR, PHONE VARCHAR,
+    CONTACT_TYPE VARCHAR, SENT_TIMESTAMP TIMESTAMP_NTZ
+);
+
+CREATE OR REPLACE PIPE BBC_SOURCE_RAW.HS_STRUTO.PIPE_CONNECTHS_UPDATES_OTH
+    AUTO_INGEST = TRUE
+AS
+    COPY INTO BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH_STG
+    FROM @EXTERNAL_INTEGRATIONS.OTH_TO_BBC.STG_OTH_TO_BBC_CONNECT_STATUS
+    FILE_FORMAT = (FORMAT_NAME = 'BBC_SOURCE_RAW.HS_STRUTO.PIPE_CSV_SAFE');
+
+CREATE OR REPLACE STREAM BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH_STG_STREAM
+    ON TABLE BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH_STG;
+*/
+
+/*----------------------------------------------------------------------------------------
+Procedure: Process OTH updates and send to HubSpot (JSON export)
+----------------------------------------------------------------------------------------*/
+CREATE OR REPLACE PROCEDURE BBC_SOURCE_RAW.HS_STRUTO.SP_CONNECTHS_UPDATES_SEND_JSON()
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    v_filename STRING;
+    sql_text STRING;
+    v_new_rows NUMBER;
+    result_message STRING;
+BEGIN
+    ALTER SESSION SET TIMEZONE = 'Europe/London';
+
+    INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH (
+        HS_OBJECT_ID, FIRSTNAME, SURNAME, CUSTOMER_STATUS, CUSTOMER_STATUS_2,
+        CUSTOMER_STATUS_OTHER, ADDRESS, CITY, ZIP, COUNTRY,
+        EMAIL, MOBILEPHONE, PHONE, CONTACT_TYPE, SENT_TIMESTAMP
+    )
+    SELECT
+        s.HS_OBJECT_ID, s.FIRSTNAME, s.SURNAME, s.FINAL_STATUS, s.FINAL_STATUS2,
+        s.CUSTOMER_STATUS_OTHER, s.ADDRESS, s.CITY, s.ZIP, s.COUNTRY,
+        s.EMAIL, s.MOBILEPHONE, s.PHONE, s.CONTACT_TYPE, NULL
+    FROM (
+        SELECT
+            stg.HS_OBJECT_ID, stg.FIRSTNAME, stg.SURNAME, stg.CUSTOMER_STATUS_OTHER,
+            stg.ADDRESS, stg.CITY, stg.ZIP, stg.COUNTRY, stg.EMAIL, stg.MOBILEPHONE,
+            stg.PHONE, stg.CONTACT_TYPE,
+            CASE 
+                WHEN stg.CUSTOMER_STATUS = 'Active' THEN 'Active'
+                WHEN stg.CUSTOMER_STATUS = 'Pending' THEN 'Inactive'
+                WHEN stg.CUSTOMER_STATUS = 'Archived' THEN 'Finished'
+                ELSE stg.CUSTOMER_STATUS
+            END AS FINAL_STATUS,
+            COALESCE(map.HS_CUSTOMER_STATUS_2, stg.CUSTOMER_STATUS_2) AS FINAL_STATUS2
+        FROM BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH_STG stg
+        LEFT JOIN BBC_SOURCE_RAW.ONETOUCH.OTH_MAPPING_CUSTOMER_STATUS_2 map
+            ON stg.CUSTOMER_STATUS_2 = map.OTH_CUSTOMERSTATUS
+        WHERE stg.HS_OBJECT_ID IS NOT NULL AND stg.HS_OBJECT_ID <> ''
+    ) s
+    LEFT JOIN (
+        SELECT MD5(
+            COALESCE(TO_VARCHAR(HS_OBJECT_ID), '') || COALESCE(FIRSTNAME, '') || COALESCE(SURNAME, '') ||
+            COALESCE(CUSTOMER_STATUS, '') || COALESCE(CUSTOMER_STATUS_2, '') || COALESCE(CUSTOMER_STATUS_OTHER, '') ||
+            COALESCE(ADDRESS, '') || COALESCE(CITY, '') || COALESCE(ZIP, '') || COALESCE(COUNTRY, '') ||
+            COALESCE(EMAIL, '') || COALESCE(MOBILEPHONE, '') || COALESCE(PHONE, '') || COALESCE(CONTACT_TYPE, '')
+        ) AS row_hash
+        FROM BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH
+    ) tgt ON tgt.row_hash = MD5(
+        COALESCE(TO_VARCHAR(s.HS_OBJECT_ID), '') || COALESCE(s.FIRSTNAME, '') || COALESCE(s.SURNAME, '') ||
+        COALESCE(s.FINAL_STATUS, '') || COALESCE(s.FINAL_STATUS2, '') || COALESCE(s.CUSTOMER_STATUS_OTHER, '') ||
+        COALESCE(s.ADDRESS, '') || COALESCE(s.CITY, '') || COALESCE(s.ZIP, '') || COALESCE(s.COUNTRY, '') ||
+        COALESCE(s.EMAIL, '') || COALESCE(s.MOBILEPHONE, '') || COALESCE(s.PHONE, '') || COALESCE(s.CONTACT_TYPE, '')
+    )
+    WHERE tgt.row_hash IS NULL;
+
+    v_new_rows := (SELECT COUNT(*) FROM BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH WHERE SENT_TIMESTAMP IS NULL);
+
+    IF (v_new_rows = 0) THEN
+        RETURN 'UPD: From OTH: No new records since last run.';
+    END IF;
+
+    v_filename := 'CUSTOMER_UPDATE_' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS') || '.json';
+
+    sql_text := '
+        COPY INTO @EXTERNAL_INTEGRATIONS.BBC_TO_CONNECTHS.STG_BBC_TO_CONNECTHS/' || v_filename || '
+        FROM (
+            SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
+                ''HS_OBJECT_ID'', u.HS_OBJECT_ID, ''FIRSTNAME'', u.FIRSTNAME, ''SURNAME'', u.SURNAME,
+                ''CUSTOMER_STATUS'', u.CUSTOMER_STATUS, ''CUSTOMER_STATUS_2'', u.CUSTOMER_STATUS_2,
+                ''CUSTOMER_STATUS_OTHER'', u.CUSTOMER_STATUS_OTHER, ''ADDRESS'', u.ADDRESS,
+                ''CITY'', u.CITY, ''ZIP'', u.ZIP, ''COUNTRY'', u.COUNTRY, ''EMAIL'', u.EMAIL,
+                ''MOBILEPHONE'', u.MOBILEPHONE, ''PHONE'', u.PHONE, ''CONTACT_TYPE'', u.CONTACT_TYPE,
+                ''PORTAL_ID'', c.PORTAL_ID
+            ))
+            FROM BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH u
+            LEFT JOIN BBC_DWH_DEV.SEMANTICMODEL.CONNECTHS_CONTACTS_NEWCUST c ON u.HS_OBJECT_ID = c.ID
+            WHERE u.SENT_TIMESTAMP IS NULL
+        )
+        FILE_FORMAT = (TYPE = ''JSON'', COMPRESSION = ''NONE'')
+        OVERWRITE = TRUE SINGLE = TRUE';
+    EXECUTE IMMEDIATE sql_text;
+
+    UPDATE BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH
+    SET SENT_TIMESTAMP = CONVERT_TIMEZONE('UTC', 'Europe/London', CURRENT_TIMESTAMP())
+    WHERE SENT_TIMESTAMP IS NULL;
+
+    CREATE OR REPLACE TABLE BBC_DWH_DEV.SEMANTICMODEL.CONNECTHS_CONTACTS_UPDATES_OTH AS
+    SELECT * FROM BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH;
+
+    result_message := 'UPD: From OTH: Sent ' || v_new_rows || ' rows in ' || v_filename;
+    
+    EXECUTE IMMEDIATE
+        'INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS 
+         (LOG_TIMESTAMP, TASK_NAME, RETURN_MESSAGE, STATUS)
+         VALUES (
+             CONVERT_TIMEZONE(''UTC'', ''Europe/London'', CURRENT_TIMESTAMP()),
+             ''TASK_CONNECT_UPD_OTH'',
+             ''' || REPLACE(result_message, '''', '''''') || ''',
+             ''SUCCESS''
+         )';
+
+    RETURN result_message;
+
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;
+        result_message := REPLACE('UPD: From OTH: ' || SQLERRM, '''', '''''');
+        
+        EXECUTE IMMEDIATE
+            'INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS 
+             (LOG_TIMESTAMP, TASK_NAME, RETURN_MESSAGE, STATUS)
+             VALUES (
+                 CONVERT_TIMEZONE(''UTC'', ''Europe/London'', CURRENT_TIMESTAMP()),
+                 ''TASK_CONNECT_UPD_OTH'',
+                 ''' || result_message || ''',
+                 ''FAILURE''
+             )';
+             
+        RETURN result_message;
+END;
+$$;
+
+/*----------------------------------------------------------------------------------------
+Tasks
+----------------------------------------------------------------------------------------*/
+CREATE OR REPLACE TASK BBC_SOURCE_RAW.HS_STRUTO.TASK_CONNECT_OTH_PIPE_REFRESH
+    WAREHOUSE = REPORT_WH
+    SCHEDULE = 'USING CRON 03 8-17 * * 1-5 UTC'
+AS
+    ALTER PIPE BBC_SOURCE_RAW.HS_STRUTO.PIPE_CONNECTHS_UPDATES_OTH REFRESH;
+
+CREATE OR REPLACE TASK BBC_SOURCE_RAW.HS_STRUTO.TASK_CONNECT_UPD_OTH
+    WAREHOUSE = REPORT_WH
+    SCHEDULE = 'USING CRON 05 8-18 * * 1-5 UTC'
+AS
+    CALL BBC_SOURCE_RAW.HS_STRUTO.SP_CONNECTHS_UPDATES_SEND_JSON();
+
+/*----------------------------------------------------------------------------------------
+Setup
+----------------------------------------------------------------------------------------*/
+-- ALTER TASK BBC_SOURCE_RAW.HS_STRUTO.TASK_CONNECT_OTH_PIPE_REFRESH RESUME;
+-- ALTER TASK BBC_SOURCE_RAW.HS_STRUTO.TASK_CONNECT_UPD_OTH RESUME;
+
+/*----------------------------------------------------------------------------------------
+Validation
+----------------------------------------------------------------------------------------*/
+-- SELECT SYSTEM$PIPE_STATUS('BBC_SOURCE_RAW.HS_STRUTO.PIPE_CONNECTHS_UPDATES_OTH');
+-- SELECT * FROM BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH_STG ORDER BY HS_OBJECT_ID DESC;
+-- SELECT * FROM BBC_SOURCE_RAW.HS_STRUTO.CONTACT_STATUS_UPDATES_OTH ORDER BY SENT_TIMESTAMP DESC;
+-- SELECT * FROM BBC_DWH_DEV.SEMANTICMODEL.CONNECTHS_CONTACTS_UPDATES_OTH ORDER BY SENT_TIMESTAMP DESC;
+-- SELECT * FROM BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS WHERE TASK_NAME LIKE '%OTH%' ORDER BY LOG_TIMESTAMP DESC;

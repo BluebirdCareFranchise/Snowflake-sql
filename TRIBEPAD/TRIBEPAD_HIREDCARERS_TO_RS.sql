@@ -6,7 +6,7 @@ Description      : Get Hired Carers from Tribepad and send to Roster Systems
 Dependencies     : 
 =============================================================================*/
 
-CREATE OR REPLACE PROCEDURE SP_TRIBEPAD_CARERS_HIRED()
+CREATE OR REPLACE PROCEDURE BBC_SOURCE_RAW.TRIBEPAD.SP_TRIBEPAD_CARERS_HIRED()
 RETURNS STRING
 LANGUAGE SQL
 EXECUTE AS CALLER
@@ -19,7 +19,7 @@ DECLARE
     v_sql          STRING;
 BEGIN
     ----------------------------------------------------------------
-    -- 1) Deduplicate source table via atomic SWAP (safe)
+    -- 1) Deduplicate source table via atomic SWAP (with safety check)
     ----------------------------------------------------------------
     CREATE OR REPLACE TABLE BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED_TMP AS
     SELECT *
@@ -31,8 +31,10 @@ BEGIN
                  NVL(CANDIDATE_PROTECTED_EMAIL,'') DESC
     ) = 1;
 
-    ALTER TABLE BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED_TMP
-    SWAP WITH BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED;
+    IF ((SELECT COUNT(*) FROM BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED_TMP) > 0) THEN
+        ALTER TABLE BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED_TMP
+        SWAP WITH BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED;
+    END IF;
 
     ----------------------------------------------------------------
     -- 2) Delta of NEW records since last SUCCESS
@@ -158,7 +160,7 @@ BEGIN
       );
 
     ----------------------------------------------------------------
-    -- 7) Tracking (only NEW records)  -- NOTE the :v_new_count bind
+    -- 7) Tracking (NEW + RETRY records)
     ----------------------------------------------------------------
     IF (v_new_count > 0) THEN
         INSERT INTO BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED_TRACKING (MAX_DATE, STATUS, RECORDS_PROCESSED)
@@ -166,10 +168,15 @@ BEGIN
         FROM TMP_CARERS_HIRED_DELTA;
     END IF;
 
+    IF (v_retry_count > 0) THEN
+        INSERT INTO BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED_TRACKING (MAX_DATE, STATUS, RECORDS_PROCESSED)
+        SELECT CURRENT_TIMESTAMP(), 'RETRY', :v_retry_count;
+    END IF;
+
     ----------------------------------------------------------------
     -- 8) Log success
     ----------------------------------------------------------------
-    v_result := 'TRIBEPAD: SUCCESS. ' || TO_VARCHAR(v_new_count + v_retry_count) || ' RECORDS PROCESSED.';
+    v_result := 'TRIBEPAD: SUCCESS. New: ' || TO_VARCHAR(v_new_count) || ', Retry: ' || TO_VARCHAR(v_retry_count) || ', Total: ' || TO_VARCHAR(v_new_count + v_retry_count) || ' processed.';
 
     v_sql := 'INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS 
            (LOG_TIMESTAMP, TASK_NAME, RETURN_MESSAGE, STATUS)
@@ -182,12 +189,8 @@ BEGIN
     EXECUTE IMMEDIATE v_sql;
 
     ----------------------------------------------------------------
-    -- 9) Cleanup (TEMP tables auto-drop at session end)
+    -- 9) Cleanup (TEMP tables auto-drop at session end, no explicit drop needed)
     ----------------------------------------------------------------
-    DROP TABLE IF EXISTS TMP_CARERS_HIRED_DELTA;
-    DROP TABLE IF EXISTS TMP_HUBCOM;
-    DROP TABLE IF EXISTS TMP_UPSERT_SET;
-    DROP TABLE IF EXISTS TMP_RETRY_CANDIDATES;
 
     RETURN v_result;
 
@@ -206,23 +209,17 @@ EXCEPTION
          )';
     EXECUTE IMMEDIATE v_sql;
 
-    -- Cleanup best-effort
-    DROP TABLE IF EXISTS TMP_CARERS_HIRED_DELTA;
-    DROP TABLE IF EXISTS TMP_HUBCOM;
-    DROP TABLE IF EXISTS TMP_UPSERT_SET;
-    DROP TABLE IF EXISTS TMP_RETRY_CANDIDATES;
+    -- Cleanup best-effort (TEMP tables auto-drop)
 
     RETURN v_result;
   END;
 END;
 $$;
 
-SELECT * FROM BBC_DWH_DEV.SEMANTICMODEL.TRIBEPAD_CARERS_HIRED_RS WHERE ROSTER_SYSTEM IS NULL
-
 -- Create or replace the task; minute hour day_of_month month day_of_week timezone
 CREATE OR REPLACE TASK D04_TRIBEPAD_CARERS_HIRED
 WAREHOUSE = REPORT_WH
-SCHEDULE = 'USING CRON 55 8-18/1,0 * * 1-5 UTC' --  
+SCHEDULE = 'USING CRON 55 8-18 * * 1-5 UTC'
 AS
     CALL SP_TRIBEPAD_CARERS_HIRED();
     
@@ -264,13 +261,9 @@ BEGIN
     WHERE ROSTER_SYSTEM = 'One Touch Health'
       AND SENT_TIMESTAMP IS NULL;
 
-    -- Exit early if no records
-    CASE 
-        WHEN v_count = 0 THEN
-            RETURN 'TRIBEPAD: NO NEW RECORDS SINCE LAST RUN';
-        ELSE
-            NULL; 
-    END CASE;
+    IF (v_count = 0) THEN
+        RETURN 'TRIBEPAD: OTH: No new records since last run.';
+    END IF;
 
     -- Build filename
     filename := 'CARERS_HIRED_' || TO_CHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS') || '.csv';
@@ -318,7 +311,7 @@ BEGIN
     ----------------------------------------------------------------
     -- Log entries
     ----------------------------------------------------------------
-    v_result := 'TRIBEPAD: OTH: ' || v_count || ' RECORDS SENT IN ' || filename;
+    v_result := 'TRIBEPAD: OTH: Sent ' || v_count || ' records in ' || filename;
 
     EXECUTE IMMEDIATE
         'INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS 
@@ -436,7 +429,7 @@ BEGIN
     ----------------------------------------------------------------
     -- Log entries
     ----------------------------------------------------------------
-    v_result := 'TRIBEPAD: PASS: ' || v_count || ' RECORDS SENT';
+    v_result := 'TRIBEPAD: PASS: Sent ' || v_count || ' records.';
 
     EXECUTE IMMEDIATE
         'INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS 
@@ -480,12 +473,6 @@ AND SENT_TIMESTAMP IS NULL;
 */
 /*END***********************************************************/
 
-
-
-
-
-
-
 /*
 SHOW TASKS;
 ALTER TASK D04_TRIBEPAD_CARERS_HIRED SUSPEND; -- ROOT TASK
@@ -493,6 +480,7 @@ ALTER TASK D04_TRIBEPAD_SENDTOOTH RESUME;
 ALTER TASK D04_TRIBEPAD_SENDTOPASS RESUME;
 ALTER TASK D04_TRIBEPAD_CARERS_HIRED RESUME;
 SHOW TASKS;
+*/
 
 /* CHECKS:
 SELECT * FROM BBC_SOURCE_RAW.TRIBEPAD.CARERS_HIRED;
@@ -601,3 +589,4 @@ AS
                 CAST(SENT_TIMESTAMP AS STRING)                    AS SENT_TIMESTAMP
             FROM BBC_DWH_DEV.SEMANTICMODEL.TRIBEPAD_CARERS_HIRED_RS
                WHERE ROSTER_SYSTEM = 'Everylife xPASS'
+*/
