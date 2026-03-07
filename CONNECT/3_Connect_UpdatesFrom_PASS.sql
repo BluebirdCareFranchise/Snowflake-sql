@@ -48,7 +48,6 @@ DECLARE
     v_new_rows NUMBER;
     result_message STRING;
 BEGIN
-    ALTER SESSION SET TIMEZONE = 'Europe/London';
 
     INSERT INTO BBC_DWH_DEV.SEMANTICMODEL.CONNECTHS_CONTACTS_UPDATES_PASS (
         HS_OBJECT_ID, OFFICE_LOCATION, FIRSTNAME, SURNAME, CUSTOMER_STATUS, CUSTOMER_STATUS_2,
@@ -81,10 +80,16 @@ BEGIN
     v_new_rows := (SELECT COUNT(*) FROM BBC_DWH_DEV.SEMANTICMODEL.CONNECTHS_CONTACTS_UPDATES_PASS WHERE SENT_TO_HS_TIMESTAMP IS NULL);
 
     IF (v_new_rows = 0) THEN
-        RETURN 'UPD: From PASS: No new records since last run.';
+        result_message := 'UPD←PASS: New=0 | No new records since last run';
+        
+        INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS 
+        (LOG_TIMESTAMP, TASK_NAME, RETURN_MESSAGE, STATUS)
+        VALUES (CONVERT_TIMEZONE('Europe/London', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ, 'TASK_CONNECT_UPD_PASS', :result_message, 'SUCCESS');
+        
+        RETURN result_message;
     END IF;
 
-    v_filename := 'CUSTOMER_UPDATE_' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS') || '.json';
+    v_filename := 'CUSTOMER_UPDATE_' || TO_VARCHAR(CONVERT_TIMEZONE('Europe/London', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ, 'YYYYMMDD_HH24MISS') || '.json';
 
     sql_text := '
         COPY INTO @EXTERNAL_INTEGRATIONS.BBC_TO_CONNECTHS.STG_BBC_TO_CONNECTHS/' || v_filename || '
@@ -106,18 +111,19 @@ BEGIN
     EXECUTE IMMEDIATE sql_text;
 
     UPDATE BBC_DWH_DEV.SEMANTICMODEL.CONNECTHS_CONTACTS_UPDATES_PASS
-    SET SENT_TO_HS_TIMESTAMP = CONVERT_TIMEZONE('UTC', 'Europe/London', CURRENT_TIMESTAMP())
+    SET SENT_TO_HS_TIMESTAMP = CONVERT_TIMEZONE('Europe/London', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ
     WHERE SENT_TO_HS_TIMESTAMP IS NULL;
 
-    result_message := 'UPD: From PASS: Sent ' || v_new_rows || ' rows in ' || v_filename;
+    result_message := 'UPD←PASS: Sent=' || v_new_rows || ' → ' || v_filename;
     
     EXECUTE IMMEDIATE
         'INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS 
-         (LOG_TIMESTAMP, TASK_NAME, RETURN_MESSAGE, STATUS)
+         (LOG_TIMESTAMP, TASK_NAME, RETURN_MESSAGE, PROCESSED_FILES, STATUS)
          VALUES (
-             CONVERT_TIMEZONE(''UTC'', ''Europe/London'', CURRENT_TIMESTAMP()),
+             CONVERT_TIMEZONE(''UTC'', ''Europe/London'', SYSDATE()),
              ''TASK_CONNECT_UPD_PASS'',
              ''' || REPLACE(result_message, '''', '''''') || ''',
+             ''' || v_filename || ''',
              ''SUCCESS''
          )';
 
@@ -126,13 +132,13 @@ BEGIN
 EXCEPTION
     WHEN OTHER THEN
         ROLLBACK;
-        result_message := REPLACE('UPD: From PASS: ' || SQLERRM, '''', '''''');
+        result_message := REPLACE('UPD←PASS ERROR: ' || SQLERRM, '''', '''''');
         
         EXECUTE IMMEDIATE
             'INSERT INTO BBC_SOURCE_RAW.HS_STRUTO.TASK_LOGS 
              (LOG_TIMESTAMP, TASK_NAME, RETURN_MESSAGE, STATUS)
              VALUES (
-                 CONVERT_TIMEZONE(''UTC'', ''Europe/London'', CURRENT_TIMESTAMP()),
+                 CONVERT_TIMEZONE(''UTC'', ''Europe/London'', SYSDATE()),
                  ''TASK_CONNECT_UPD_PASS'',
                  ''' || result_message || ''',
                  ''FAILURE''
@@ -145,7 +151,7 @@ $$;
 /*----------------------------------------------------------------------------------------
 Task
 ----------------------------------------------------------------------------------------*/
-CREATE OR REPLACE TASK BBC_SOURCE_RAW.HS_STRUTO.TASK_CONNECT_UPD_PASS
+CREATE OR REPLACE TASK BBC_CONFORMED.ORCHESTRATE.TASK_CONNECT_UPD_PASS
     WAREHOUSE = REPORT_WH
     SCHEDULE = 'USING CRON 25 8-18 * * 1-5 UTC'
 AS
